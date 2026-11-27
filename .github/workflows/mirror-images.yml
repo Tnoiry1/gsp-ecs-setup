@@ -1,0 +1,75 @@
+name: Mirror GSP images
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  mirror:
+    name: ${{ matrix.source }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - source: nipreps/fmriprep:25.2.5
+            target: gsp-fmriprep:25.2.5
+          - source: pennlinc/xcp_d:26.1.1
+            target: gsp-xcp-d:26.1.1
+
+    steps:
+      - name: Install image copy tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+
+      - name: Copy and verify original image
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GSP_SOURCE: ${{ matrix.source }}
+          GSP_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          umask 077
+
+          export REGISTRY_AUTH_FILE="${RUNNER_TEMP}/gsp-auth.json"
+          trap 'rm -f -- "$REGISTRY_AUTH_FILE"' EXIT
+
+          gsp_owner="${GITHUB_REPOSITORY_OWNER,,}"
+          gsp_dest="ghcr.io/${gsp_owner}/${GSP_TARGET}"
+
+          printf '%s' "$GH_TOKEN" |
+            skopeo login --username "$GITHUB_ACTOR" \
+              --password-stdin ghcr.io
+
+          skopeo --override-os linux --override-arch amd64 \
+            inspect --retry-times 3 --config --raw \
+            "docker://docker.io/${GSP_SOURCE}" \
+            > "${RUNNER_TEMP}/source-config.json"
+
+          skopeo --override-os linux --override-arch amd64 \
+            copy --retry-times 3 --preserve-digests \
+            --digestfile "${RUNNER_TEMP}/image-digest.txt" \
+            "docker://docker.io/${GSP_SOURCE}" \
+            "docker://${gsp_dest}"
+
+          skopeo --override-os linux --override-arch amd64 \
+            inspect --retry-times 3 --config --raw \
+            "docker://${gsp_dest}" \
+            > "${RUNNER_TEMP}/target-config.json"
+
+          cmp "${RUNNER_TEMP}/source-config.json" \
+              "${RUNNER_TEMP}/target-config.json"
+
+          gsp_id="sha256:$(sha256sum "${RUNNER_TEMP}/source-config.json" | cut -d ' ' -f 1)"
+          gsp_digest=$(cat "${RUNNER_TEMP}/image-digest.txt")
+          gsp_pinned="${gsp_dest%:*}@${gsp_digest}"
+
+          printf 'Image ID: `%s`\n\n```bash\nsudo /usr/local/sbin/gsp-check-data-mount\nsudo docker pull --platform linux/amd64 %s\nsudo docker tag %s %s\n```\n' \
+            "$gsp_id" "$gsp_pinned" "$gsp_pinned" "$GSP_SOURCE" \
+            >> "$GITHUB_STEP_SUMMARY"
